@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 .env
+node_modules/
+.yarnrc
+out/
 
 # Node.js
 node_modules/
