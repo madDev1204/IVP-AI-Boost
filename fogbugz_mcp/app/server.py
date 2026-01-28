@@ -44,7 +44,16 @@ def list_wikis():
 
 
 @mcp.tool()
+def ping():
+    """
+    Simple connectivity test.
+    """
+    return "pong"
+
+
+@mcp.tool()
 def list_articles(wiki_id: int):
+
     """
     List articles within a specific wiki.
     
@@ -60,7 +69,23 @@ def list_articles(wiki_id: int):
 
 
 @mcp.tool()
+def search_articles(query: str):
+    """
+    Search for FogBugz articles by keyword.
+    
+    Input:
+      - query: string (search term)
+    
+    Returns:
+      - article_id
+      - title
+    """
+    return client.search_articles(query)
+
+
+@mcp.tool()
 def view_article(article_id: int):
+
     """
     Retrieve the full content of a FogBugz article.
     
@@ -78,10 +103,12 @@ def view_article(article_id: int):
 
 
 def main():
-    # Run MCP server
-    mcp.run()
-    print("FogBugz MCP server started")
+    # Run MCP server using SSE (HTTP) transport
+    print("Starting FogBugz MCP server on http://localhost:8000")
+    mcp.run(transport="sse")
 
 
-# if __name__ == "__main__":
-#     main_func()
+if __name__ == "__main__":
+    main()
+
+
