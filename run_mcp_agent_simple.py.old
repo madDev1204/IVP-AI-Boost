@@ -1,0 +1,200 @@
+import os
+import sys
+import subprocess
+import time
+import asyncio
+from typing import List, Optional
+
+# Check dependencies
+try:
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+    from langchain_core.tools import StructuredTool
+    from langchain_openai import ChatOpenAI
+    from pydantic import BaseModel, Field
+    import mcp
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+except ImportError as e:
+    print(f"Missing dependency: {e}")
+    sys.exit(1)
+
+import dotenv
+dotenv.load_dotenv(os.path.join(os.getcwd(), "azure-openai-client", ".env"))
+dotenv.load_dotenv(os.path.join(os.getcwd(), "fogbugz_mcp", ".env"))
+
+# Define Pydantic models for the tools
+class ListWikisInput(BaseModel):
+    pass
+
+class ListArticlesInput(BaseModel):
+    wiki_id: int = Field(..., description="The ID of the wiki to list articles from")
+
+class SearchArticlesInput(BaseModel):
+    query: str = Field(..., description="The search query")
+
+class ViewArticleInput(BaseModel):
+    article_id: int = Field(..., description="The ID of the article to view")
+
+async def run_agent():
+    # 1. Start the MCP Server
+    print("Starting MCP Server...")
+    server_process = subprocess.Popen(
+        [sys.executable, "-m", "fogbugz_mcp.app.server"],
+        cwd=os.getcwd(),
+        env=os.environ.copy()
+    )
+    
+    # Wait for server to start
+    print("Waiting for server to initialize (5s)...")
+    time.sleep(5)
+    
+    if server_process.poll() is not None:
+        print("Server failed to start.")
+        return
+
+    server_url = "http://localhost:8000/sse"
+
+    try:
+        print(f"Connecting to MCP Server at {server_url}...")
+        async with sse_client(server_url) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                
+                mcp_tools = await session.list_tools()
+                print(f"Found MCP tools: {[t.name for t in mcp_tools.tools]}")
+
+                # Create LangChain tools wrappers
+                lc_tools = []
+                
+                async def list_wikis_wrapper() -> str:
+                    result = await session.call_tool("list_wikis", arguments={})
+                    return str(result.content)
+
+                lc_tools.append(StructuredTool.from_function(
+                    func=None,
+                    coroutine=list_wikis_wrapper,
+                    name="list_wikis",
+                    description="List all active FogBugz wiki spaces.",
+                    args_schema=ListWikisInput
+                ))
+
+                async def list_articles_wrapper(wiki_id: int) -> str:
+                    result = await session.call_tool("list_articles", arguments={"wiki_id": wiki_id})
+                    return str(result.content)
+
+                lc_tools.append(StructuredTool.from_function(
+                    func=None,
+                    coroutine=list_articles_wrapper,
+                    name="list_articles",
+                    description="List articles within a specific wiki.",
+                    args_schema=ListArticlesInput
+                ))
+
+                async def search_articles_wrapper(query: str) -> str:
+                    result = await session.call_tool("search_articles", arguments={"query": query})
+                    return str(result.content)
+                
+                lc_tools.append(StructuredTool.from_function(
+                    func=None,
+                    coroutine=search_articles_wrapper,
+                    name="search_articles",
+                    description="Search for FogBugz articles by keyword.",
+                    args_schema=SearchArticlesInput
+                ))
+
+                async def view_article_wrapper(article_id: int) -> str:
+                    result = await session.call_tool("view_article", arguments={"article_id": article_id})
+                    return str(result.content)
+
+                lc_tools.append(StructuredTool.from_function(
+                    func=None,
+                    coroutine=view_article_wrapper,
+                    name="view_article",
+                    description="Retrieve the full content of a FogBugz article.",
+                    args_schema=ViewArticleInput
+                ))
+
+                # Initialize LLM
+                api_key = os.environ.get("OPENAI_API_KEY")
+                azure_key = os.environ.get("AZURE_OPENAI_API_KEY")
+                
+                if azure_key:
+                    print("Using Azure OpenAI Configuration")
+                    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+                    deployment = os.environ.get("AZURE_OPENAI_MODEL", "gpt-4")
+                    # If endpoint is a proxy, we might need simple ChatOpenAI with base_url
+                    # But if variables say AZURE, try AzureChatOpenAI first.
+                    # Note: api_version is required for Azure.
+                    from langchain_openai import AzureChatOpenAI
+                    llm = AzureChatOpenAI(
+                        azure_endpoint=endpoint,
+                        api_key=azure_key,
+                        azure_deployment=deployment,
+                        api_version="2023-05-15",
+                        temperature=0
+                    )
+                elif api_key:
+                    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+                else:
+                    print("ERROR: No API keys found. Please set OPENAI_API_KEY or AZURE_OPENAI_API_KEY.")
+                    return
+
+                llm_with_tools = llm.bind_tools(lc_tools)
+
+                messages = [
+                    SystemMessage(content="You are a helpful assistant that can access FogBugz documentation. Use the available tools to answer the user's questions."),
+                    HumanMessage(content="What wikis are available? Please list them.")
+                ]
+
+                print("\n--- Running Agent Query ---\n")
+                print(f"User: {messages[-1].content}")
+                
+                 # Simple ReAct Loop
+                for i in range(5):
+                    print(f"\n--- Step {i+1} ---")
+                    response = await llm_with_tools.ainvoke(messages)
+                    messages.append(response)
+                    
+                    if not response.tool_calls:
+                        print("\nAgent Final Response:")
+                        print(response.content)
+                        break
+                    
+                    for tool_call in response.tool_calls:
+                        tool_name = tool_call['name']
+                        tool_args = tool_call['args']
+                        tool_id = tool_call['id']
+                        print(f"Tool Request: {tool_name}({tool_args})")
+                        
+                        tool = next((t for t in lc_tools if t.name == tool_name), None)
+                        if tool:
+                            try:
+                                tool_result = await tool.ainvoke(tool_args)
+                                print(f"Tool Output: {str(tool_result)[:200]}...")
+                                
+                                messages.append(ToolMessage(
+                                    tool_call_id=tool_id,
+                                    content=str(tool_result),
+                                    name=tool_name
+                                ))
+                            except Exception as e:
+                                error_msg = f"Error executing tool {tool_name}: {e}"
+                                print(error_msg)
+                                messages.append(ToolMessage(
+                                    tool_call_id=tool_id,
+                                    content=error_msg,
+                                    name=tool_name
+                                ))
+                        else:
+                            print(f"Tool {tool_name} not found!")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\nStopping MCP Server...")
+        server_process.terminate()
+        server_process.wait()
+
+if __name__ == "__main__":
+    asyncio.run(run_agent())
